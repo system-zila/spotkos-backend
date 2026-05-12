@@ -1,24 +1,27 @@
+// PERBAIKAN 1: Wajib ada agar membaca file .env untuk koneksi ke TiDB Cloud
+require('dotenv').config();
 const mysql = require('mysql2/promise');
 
 async function seedDatabase() {
   // 1. Buka Koneksi ke MySQL
- const db = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT,
-  ssl: {
-    rejectUnauthorized: true // Wajib ditambahkan untuk TiDB Cloud
-  }
-});
+  const db = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT,
+    ssl: {
+      rejectUnauthorized: true // Wajib ditambahkan untuk TiDB Cloud
+    }
+  });
 
   console.log('Terhubung ke database. Memulai migrasi data...');
 
   try {
     // 2. Injeksi Data Pengguna (Admin & Owner)
+    // PERBAIKAN 2: Mengubah kolom 'name' menjadi 'full_name' sesuai skema terbaru
     await db.query(`
-      INSERT INTO users (name, email, password, role, phone) VALUES
+      INSERT INTO users (full_name, email, password, role, phone) VALUES
       ('Admin SpotKos', 'admin@spotkos.com', 'admin123', 'admin', '081200000000'),
       ('Ibu Melati', 'melati@email.com', 'owner123', 'owner', '081234567890'),
       ('Pak Wayan', 'wayan@email.com', 'owner123', 'owner', '081987654321')
@@ -42,13 +45,12 @@ async function seedDatabase() {
         room_size: "3 x 4 meter", capacity: "1 orang", bathroom_type: "Kamar mandi dalam", floor_range: "Lantai 2-4", owner_name: "Ibu Melati", owner_phone: "0812-3456-7890", owner_response_time: "Cepat (< 1 jam)"
       },
       {
-        name: "Kost Permata Hijau", location: "Dago, Bandung", address: "Jl. Dago Atas No. 88", price: 1800000, rating: 4.8, reviews_count: 89, gender: "Putri", description: "Kost khusus putri yang aman dan sejuk.",
+        name: "Kost Permata Hijau", location: "Dago, Bandung", address: "Jl. Dago Atas No. 88", price: 1800000, rating: 4.8, reviews_count: 89, gender: "Wanita", description: "Kost khusus putri yang aman dan sejuk.",
         image: "https://images.unsplash.com/photo-1636321667799-ddf30b3e1261",
         images: JSON.stringify(["https://images.unsplash.com/photo-1636321667799-ddf30b3e1261"]),
         facilities: JSON.stringify(["AC", "Wi-Fi", "Kamar Mandi Luar"]), rules: JSON.stringify(["Khusus putri", "Jam malam 20.00"]), nearby_places: JSON.stringify(["ITB - 3 km"]), availability: JSON.stringify({totalRooms: 15, availableRooms: 10}), payment_methods: JSON.stringify(["Visa"]),
         room_size: "3 x 3 meter", capacity: "1 orang", bathroom_type: "Kamar mandi luar", floor_range: "Lantai 1-3", owner_name: "Ibu Permata", owner_phone: "0813-2345-6789", owner_response_time: "Cepat"
       }
-      // Anda dapat menyalin sisa data dari rooms.ts ke dalam format objek ini
     ];
 
     for (const room of rooms) {
