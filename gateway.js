@@ -5,7 +5,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+app.use(cors({ origin: '*', credentials: true }));
 
 // Berikan akses langsung ke folder foto/gambar agar tidak error 404
 app.use('/uploads', express.static('uploads'));
@@ -49,4 +49,5 @@ app.use((req, res, next) => {
     next();
 });
 
-app.listen(5000, () => console.log('✅ API Gateway berjalan di Port 5000 (Sistem Anti-Potong URL Aktif)'));
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`✅ API Gateway berjalan di Port ${PORT}`));
