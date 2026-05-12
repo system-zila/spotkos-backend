@@ -30,7 +30,7 @@ async function seedDatabase() {
 
     // 3. Injeksi Data Artikel (Format JSON untuk struktur kompleks)
     await db.query(`
-      INSERT INTO articles (title, content, image, author_id) VALUES
+      INSERT INTO articles (title, content, image, author) VALUES
       ('7 Tips Mencari Kos yang Aman dan Nyaman', '{"intro":"Mencari kos yang tepat gampang-gampang susah...","sections":[{"heading":"1. Cek Lokasi","content":"Pastikan dekat kampus..."}]}', 'https://images.unsplash.com/photo-1522771739844-6a9f6d5f14af', 1)
     `);
     console.log('✅ Data Artikel berhasil diinput.');
