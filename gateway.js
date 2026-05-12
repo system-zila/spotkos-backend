@@ -5,6 +5,12 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 
+app.use((req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp'); // Opsional, jika dibutuhkan
+    next();
+});
+
 app.use(cors({ 
     origin: ['https://spotkos.vercel.app', 'http://localhost:5173'], 
     credentials: true,
