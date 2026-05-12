@@ -5,7 +5,10 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const app = express();
 
-app.use(cors({ origin: '*', credentials: true }));
+app.use(cors({ 
+    origin: [process.env.FRONTEND_URL, 'http://localhost:5173'], 
+    credentials: true 
+}));
 
 // Berikan akses langsung ke folder foto/gambar agar tidak error 404
 app.use('/uploads', express.static('uploads'));
