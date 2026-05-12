@@ -59,6 +59,9 @@ function buildAvatarUrl(avatarValue) {
 // =========================================================================
 // 1. GOOGLE LOGIN - FIX UTAMA
 // =========================================================================
+// =========================================================================
+// 1. GOOGLE LOGIN - FIX FOTO PROFIL (LENGKAP 100%)
+// =========================================================================
 app.post('/api/google-login', async (req, res) => {
   const { token } = req.body;
 
@@ -67,8 +70,7 @@ app.post('/api/google-login', async (req, res) => {
   }
 
   try {
-    // ✅ FIX: Verifikasi token dengan audience yang benar
-    // Tanpa ini, token dari device lain (Android, iOS, web lain) bisa ditolak
+    // ✅ Verifikasi token dengan audience yang benar
     const ticket = await googleClient.verifyIdToken({
       idToken: token,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -85,35 +87,40 @@ app.post('/api/google-login', async (req, res) => {
     const [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
 
     if (users.length === 0) {
-      // User baru: daftarkan otomatis dengan password kosong
+      // User baru: daftarkan otomatis dengan password kosong dan simpan foto
       await db.query(
         `INSERT INTO users 
           (full_name, email, password, role, avatar, notif_email, notif_sms, notif_promo, notif_reminder) 
          VALUES (?, ?, "", "user", ?, 1, 0, 0, 1)`,
         [name, email, picture]
       );
-      
-      return res.json({
-        message: 'Registrasi Google berhasil',
-        user: { name, email, role: 'user', avatar: picture }
-      });
+    } else {
+      // ✅ INI ADALAH LOGIKA YANG HILANG DI KODE ANDA:
+      // Jika user sudah terdaftar tapi kolom fotonya kosong (karena reset DB), simpan foto dari Google.
+      if (!users[0].avatar && picture) {
+        await db.query('UPDATE users SET avatar = ? WHERE email = ?', [picture, email]);
+      }
     }
 
+    // Ambil ulang data terbaru dari database setelah proses Insert/Update di atas selesai
+    const [updatedUsers] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
+    const finalUser = updatedUsers[0];
+
     // Pengecekan jika akun sedang di-suspend oleh admin
-    if (users[0].status === 'suspended') {
+    if (finalUser.status === 'suspended') {
       return res.status(403).json({ error: 'Akses Ditolak: Akun Anda telah dibekukan oleh Admin.' });
     }
 
-    // Menggabungkan URL avatar
-    const avatarUrl = buildAvatarUrl(users[0].avatar) || picture;
+    // Menggabungkan URL avatar secara aman
+    const avatarUrl = buildAvatarUrl(finalUser.avatar) || picture;
 
     // Mengembalikan data user ke frontend
     res.json({
       message: 'Login Google berhasil',
       user: {
-        name: users[0].full_name,
-        email: email,
-        role: users[0].role,
+        name: finalUser.full_name,
+        email: finalUser.email,
+        role: finalUser.role,
         avatar: avatarUrl
       }
     });
@@ -121,7 +128,7 @@ app.post('/api/google-login', async (req, res) => {
   } catch (error) {
     console.error('Google Auth Error:', error.message);
     
-    // ✅ FIX: Pesan error yang lebih informatif untuk debug
+    // Pesan error yang informatif untuk debug
     if (error.message && error.message.includes('Token used too late')) {
       return res.status(401).json({ error: 'Token Google kedaluwarsa. Silakan login ulang.' });
     }
