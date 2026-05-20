@@ -57,10 +57,7 @@ function buildAvatarUrl(avatarValue) {
 }
 
 // =========================================================================
-// 1. GOOGLE LOGIN - FIX UTAMA
-// =========================================================================
-// =========================================================================
-// 1. GOOGLE LOGIN - FIX FOTO PROFIL (LENGKAP 100%)
+// 1. GOOGLE LOGIN - FULL FIX (AUTO-HEAL AVATAR)
 // =========================================================================
 app.post('/api/google-login', async (req, res) => {
   const { token } = req.body;
@@ -70,7 +67,6 @@ app.post('/api/google-login', async (req, res) => {
   }
 
   try {
-    // ✅ Verifikasi token dengan audience yang benar
     const ticket = await googleClient.verifyIdToken({
       idToken: token,
       audience: process.env.GOOGLE_CLIENT_ID,
@@ -82,8 +78,6 @@ app.post('/api/google-login', async (req, res) => {
     }
 
     const { email, name, picture } = payload;
-
-    // Mencari apakah email Google ini sudah ada di database
     const [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
 
     if (users.length === 0) {
@@ -95,14 +89,17 @@ app.post('/api/google-login', async (req, res) => {
         [name, email, picture]
       );
     } else {
-      // ✅ INI ADALAH LOGIKA YANG HILANG DI KODE ANDA:
-      // Jika user sudah terdaftar tapi kolom fotonya kosong (karena reset DB), simpan foto dari Google.
-      if (!users[0].avatar && picture) {
+      // ✅ LOGIKA PENYEMBUHAN OTOMATIS (AUTO-HEAL)
+      const currentAvatar = users[0].avatar || '';
+      
+      // Jika avatar kosong ATAU berisi URL Google yang rusak/terpotong, timpa dengan URL baru dari Google.
+      // Jika foto adalah hasil upload manual pengguna (tidak mengandung 'http'), sistem tidak akan menimpanya.
+      if (picture && (!currentAvatar || currentAvatar.includes('googleusercontent') || currentAvatar.includes('http'))) {
         await db.query('UPDATE users SET avatar = ? WHERE email = ?', [picture, email]);
       }
     }
 
-    // Ambil ulang data terbaru dari database setelah proses Insert/Update di atas selesai
+    // Ambil ulang data terbaru dari database setelah proses Insert/Update
     const [updatedUsers] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
     const finalUser = updatedUsers[0];
 

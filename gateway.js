@@ -16,7 +16,8 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  // ✅ FIX: Daftarkan header ngrok agar tidak diblokir saat Preflight
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'] 
 }));
 
 app.use('/uploads', createProxyMiddleware({ target: 'http://localhost:5001', changeOrigin: true }));
