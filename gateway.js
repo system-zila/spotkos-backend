@@ -19,7 +19,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use('/uploads', express.static('uploads'));
+app.use('/uploads', createProxyMiddleware({ target: 'http://localhost:5001', changeOrigin: true }));
 
 const userServiceProxy = createProxyMiddleware({ target: 'http://localhost:5001', changeOrigin: true });
 const roomServiceProxy = createProxyMiddleware({ target: 'http://localhost:5002', changeOrigin: true });
