@@ -2,13 +2,18 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const midtransClient = require('midtrans-client');
-
-// ✅ FIX: Gunakan shared DB pool
 const db = require('./db');
 
 const app = express();
+
 app.use(cors());
 app.use(express.json());
+
+// ✅ FIX NGROK: Bypass interstitial page
+app.use((req, res, next) => {
+  res.setHeader('ngrok-skip-browser-warning', 'true');
+  next();
+});
 
 const snap = new midtransClient.Snap({
   isProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
@@ -19,13 +24,11 @@ const snap = new midtransClient.Snap({
 app.post('/api/payment/create-transaction', async (req, res) => {
   const { name, email, phone, amount, kostName } = req.body;
   const order_id = `SPOTKOS-${Date.now()}`;
-
   const parameter = {
     transaction_details: { order_id, gross_amount: amount },
     customer_details: { first_name: name, email, phone },
     item_details: [{ id: 'KOST-01', price: amount, quantity: 1, name: `Sewa ${kostName} (1 Bulan)` }]
   };
-
   try {
     const transaction = await snap.createTransaction(parameter);
     res.json({ token: transaction.token, order_id });
@@ -36,10 +39,20 @@ app.post('/api/payment/create-transaction', async (req, res) => {
 });
 
 app.post('/api/bookings', async (req, res) => {
-  const { userEmail, roomId, floorName, checkInDate, duration, totalPrice } = req.body;
+  const userEmail   = req.body.email || req.body.user_email;
+  const roomId      = req.body.roomId || req.body.room_id;
+  const floorName   = req.body.floorName || req.body.floor_name;
+  const checkInDate = req.body.checkInDate || req.body.check_in_date;
+  const duration    = parseInt(req.body.duration) || 1;
+  const totalPrice  = req.body.totalPrice || req.body.total_price;
 
+  if (!userEmail || !roomId || !checkInDate) {
+    return res.status(400).json({ error: 'Data tidak lengkap' });
+  }
+
+  // ✅ FIX BUG #6: Validasi floorName wajib ada sebelum cek stok
   if (!floorName) {
-      return res.status(400).json({ error: 'Lantai kamar wajib dipilih sebelum melanjutkan booking' });
+    return res.status(400).json({ error: 'Lantai wajib dipilih sebelum booking.' });
   }
 
   try {
@@ -80,7 +93,6 @@ app.get('/api/bookings/user', async (req, res) => {
       if (b.status === 'paid') {
         const dueDate = new Date(b.check_in_date);
         dueDate.setMonth(dueDate.getMonth() + b.duration);
-
         const cancelDate = new Date(dueDate);
         cancelDate.setDate(cancelDate.getDate() + 3);
 
@@ -103,7 +115,8 @@ app.get('/api/bookings/user', async (req, res) => {
              DATE_FORMAT(b.created_at, "%d %b %Y") as bookingDate,
              DATE_FORMAT(b.check_in_date, "%d %b %Y") as moveInDate,
              b.status, b.total_price as totalPrice, b.duration,
-             r.name as roomName, r.location as roomLocation, r.image as roomImage
+             r.name as roomName, r.location as roomLocation, r.image as roomImage,
+             (SELECT rating FROM reviews WHERE booking_id = b.id LIMIT 1) AS user_rating
       FROM bookings b JOIN rooms r ON b.room_id = r.id
       WHERE b.user_email = ? ORDER BY b.created_at DESC
     `, [email]);
@@ -112,6 +125,194 @@ app.get('/api/bookings/user', async (req, res) => {
   } catch (error) {
     console.error('User Bookings Error:', error);
     res.status(500).json({ error: 'Gagal mengambil riwayat booking' });
+  }
+});
+
+app.post('/api/topup', async (req, res) => {
+  const { email, amount } = req.body;
+
+  if (!email || !amount) {
+    return res.status(400).json({ success: false, message: 'Email dan nominal wajib diisi.' });
+  }
+
+  try {
+    const [result] = await db.query(
+      'UPDATE users SET balance = balance + ? WHERE email = ?',
+      [amount, email]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'User tidak ditemukan.' });
+    }
+
+    res.json({ success: true, message: `Top up Rp ${amount} berhasil!` });
+  } catch (error) {
+    console.error('Top Up Error:', error);
+    res.status(500).json({ success: false, message: 'Gagal melakukan top up server.' });
+  }
+});
+
+// =========================================================================
+// RUTE TRANSAKSI DENGAN PROTEKSI KETAT (PIN)
+// =========================================================================
+
+app.post('/api/transfer', async (req, res) => {
+  const { sender_email, receiver_identifier, amount, pin } = req.body;
+
+  if (!sender_email || !receiver_identifier || !amount || !pin) {
+    return res.status(400).json({ success: false, message: 'Data atau PIN tidak lengkap' });
+  }
+
+  try {
+    const [sender] = await db.query('SELECT balance, pin FROM users WHERE email = ?', [sender_email]);
+    if (sender.length === 0) return res.status(404).json({ success: false, message: 'Akun Anda tidak ditemukan' });
+
+    // Validasi Keamanan PIN
+    if (!sender[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di menu Keamanan Akun terlebih dahulu.' });
+    if (sender[0].pin !== pin) return res.status(400).json({ success: false, message: 'PIN Transaksi Anda salah!' });
+    if (sender[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi' });
+
+    const [receiver] = await db.query('SELECT email FROM users WHERE email = ? OR phone = ?', [receiver_identifier, receiver_identifier]);
+    if (receiver.length === 0) return res.status(404).json({ success: false, message: 'Pengguna tujuan tidak ditemukan' });
+    if (sender_email === receiver[0].email) return res.status(400).json({ success: false, message: 'Tidak bisa transfer ke akun sendiri' });
+
+    await db.query('UPDATE users SET balance = balance - ? WHERE email = ?', [amount, sender_email]);
+    await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [amount, receiver[0].email]);
+
+    res.json({ success: true, message: 'Transfer berhasil!' });
+  } catch (error) {
+    console.error('Transfer Error:', error);
+    res.status(500).json({ success: false, message: 'Gagal memproses transfer' });
+  }
+});
+
+app.post('/api/pay-kos', async (req, res) => {
+  const { email, booking_id, amount, pin } = req.body;
+
+  if (!email || !booking_id || !amount || !pin) {
+    return res.status(400).json({ success: false, message: 'Data atau PIN tidak lengkap' });
+  }
+
+  try {
+    const [tenant] = await db.query('SELECT balance, pin FROM users WHERE email = ?', [email]);
+    if (tenant.length === 0) return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
+
+    // Validasi Keamanan PIN
+    if (!tenant[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di menu Keamanan Akun.' });
+    if (tenant[0].pin !== pin) return res.status(400).json({ success: false, message: 'PIN Transaksi Anda salah!' });
+    if (tenant[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo SpotPay Anda tidak mencukupi, silakan Top Up.' });
+
+    const [booking] = await db.query(
+      'SELECT b.status, b.room_id, b.floor_name, r.owner_email FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?',
+      [booking_id]
+    );
+
+    if (booking.length === 0) return res.status(404).json({ success: false, message: 'Tagihan tidak ditemukan' });
+    if (booking[0].status === 'paid') return res.status(400).json({ success: false, message: 'Tagihan sudah lunas' });
+
+    await db.query('UPDATE users SET balance = balance - ? WHERE email = ?', [amount, email]);
+    await db.query('UPDATE bookings SET status = "paid" WHERE id = ?', [booking_id]);
+
+    if (booking[0].room_id && booking[0].floor_name) {
+      await db.query(
+        'UPDATE room_floors SET available_rooms = available_rooms - 1 WHERE room_id = ? AND floor_name = ?',
+        [booking[0].room_id, booking[0].floor_name]
+      );
+    }
+
+    if (booking[0].owner_email) {
+      await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [amount, booking[0].owner_email]);
+    }
+
+    res.json({ success: true, message: 'Pembayaran Kos Berhasil!' });
+  } catch (error) {
+    console.error('Pay Kos Error:', error);
+    res.status(500).json({ success: false, message: 'Gagal memproses pembayaran kos' });
+  }
+});
+
+app.post('/api/installments/pay', async (req, res) => {
+  const { email, bill_id, amount, pin } = req.body;
+
+  if (!email || !bill_id || !amount || !pin) {
+    return res.status(400).json({ success: false, message: 'Data atau PIN tidak lengkap' });
+  }
+
+  try {
+    const [user] = await db.query('SELECT balance, pin FROM users WHERE email = ?', [email]);
+    if (user.length === 0) return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
+
+    // Validasi Keamanan PIN
+    if (!user[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di menu Keamanan Akun.' });
+    if (user[0].pin !== pin) return res.status(400).json({ success: false, message: 'PIN Transaksi Anda salah!' });
+    if (user[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi untuk transaksi ini.' });
+
+    await db.query('UPDATE users SET balance = balance - ? WHERE email = ?', [amount, email]);
+
+    res.json({ success: true, message: 'Transaksi Berhasil!' });
+  } catch (error) {
+    console.error('Installment Error:', error);
+    res.status(500).json({ success: false, message: 'Gagal memproses transaksi' });
+  }
+});
+
+// =========================================================================
+
+app.get('/api/bookings/owner', async (req, res) => {
+  const { email } = req.query;
+  try {
+    const [incomes] = await db.query(`
+      SELECT b.id as booking_id, b.room_id as roomId, b.floor_name as floorName,
+             DATE_FORMAT(b.created_at, "%d %b %Y") as bookingDate,
+             b.status, (b.total_price * b.duration) as totalPrice, b.duration,
+             r.name as roomName, u.full_name as tenant_name
+      FROM bookings b
+      JOIN rooms r ON b.room_id = r.id
+      JOIN users u ON b.user_email = u.email
+      WHERE r.owner_email = ? ORDER BY b.created_at DESC
+    `, [email]);
+    res.json(incomes);
+  } catch (error) {
+    console.error('Owner Income Error:', error);
+    res.status(500).json({ error: 'Gagal mengambil data pemasukan' });
+  }
+});
+
+app.post('/api/promos/claim', async (req, res) => {
+  const { email, promo_code } = req.body;
+
+  if (!email || !promo_code) {
+    return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
+  }
+
+  const code = promo_code.toUpperCase().trim();
+  let bonusAmount = 0;
+
+  if (code === 'SPOTPAY50K') {
+    bonusAmount = 50000;
+  } else if (code === 'DISKONKOS') {
+    bonusAmount = 25000;
+  } else {
+    return res.status(400).json({ success: false, message: 'Kode promo salah atau sudah melewati batas kuota.' });
+  }
+
+  try {
+    const [result] = await db.query(
+      'UPDATE users SET balance = balance + ? WHERE email = ?',
+      [bonusAmount, email]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: 'Akun pengguna gagal diverifikasi.' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: `Selamat! Kode ${code} sukses diklaim. Bonus Rp ${bonusAmount.toLocaleString('id-ID')} telah ditambahkan.` 
+    });
+  } catch (error) {
+    console.error('Promo Claim Error:', error);
+    res.status(500).json({ success: false, message: 'Gagal memproses kode promo di server.' });
   }
 });
 
@@ -130,13 +331,11 @@ app.put('/api/bookings/:id/status', async (req, res) => {
           [roomId, floorName]
         );
       }
-
       const [bookingInfo] = await db.query(
         `SELECT b.duration, r.price, r.owner_email 
          FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?`,
         [id]
       );
-
       if (bookingInfo.length > 0 && bookingInfo[0].owner_email) {
         const pureIncome = bookingInfo[0].price * bookingInfo[0].duration;
         await db.query(
@@ -160,9 +359,7 @@ app.post('/api/withdrawals', async (req, res) => {
       'UPDATE users SET balance = balance - ? WHERE email = ? AND balance >= ?',
       [amount, email, amount]
     );
-    if (updateRes.affectedRows === 0) {
-      return res.status(400).json({ error: 'Saldo tidak mencukupi.' });
-    }
+    if (updateRes.affectedRows === 0) return res.status(400).json({ error: 'Saldo tidak mencukupi.' });
     await db.query(
       'INSERT INTO withdrawals (user_email, amount, status) VALUES (?, ?, "pending")',
       [email, amount]
@@ -171,6 +368,20 @@ app.post('/api/withdrawals', async (req, res) => {
   } catch (error) {
     console.error('Withdrawal Error:', error);
     res.status(500).json({ error: 'Gagal mengajukan pencairan' });
+  }
+});
+
+app.get('/api/withdrawals/user', async (req, res) => {
+  const { email } = req.query;
+  try {
+    const [withdrawals] = await db.query(
+      'SELECT *, DATE_FORMAT(created_at, "%d %b %Y") as date_label FROM withdrawals WHERE user_email = ? ORDER BY created_at DESC',
+      [email]
+    );
+    res.json(withdrawals);
+  } catch (error) {
+    console.error('Get User Withdrawals Error:', error);
+    res.status(500).json({ error: 'Gagal mengambil data penarikan' });
   }
 });
 
@@ -191,18 +402,12 @@ app.get('/api/admin/withdrawals', async (req, res) => {
 app.put('/api/admin/withdrawals/:id/status', async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
-
   try {
     const [wd] = await db.query('SELECT * FROM withdrawals WHERE id = ?', [id]);
     if (wd.length === 0) return res.status(404).json({ error: 'Data tidak ditemukan' });
-
     await db.query('UPDATE withdrawals SET status = ? WHERE id = ?', [status, id]);
-
     if (status === 'rejected') {
-      await db.query(
-        'UPDATE users SET balance = balance + ? WHERE email = ?',
-        [wd[0].amount, wd[0].user_email]
-      );
+      await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [wd[0].amount, wd[0].user_email]);
     }
     res.json({ message: `Penarikan saldo berhasil di-${status}` });
   } catch (error) {
@@ -236,7 +441,6 @@ app.get('/api/admin/transactions', async (req, res) => {
   }
 });
 
-// Auto-evaluator: jalankan setiap 1 jam
 setInterval(async () => {
   try {
     await db.query(
