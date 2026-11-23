@@ -21,21 +21,92 @@ const snap = new midtransClient.Snap({
   clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
+(async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS digital_transactions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_email VARCHAR(100) NOT NULL,
+        transaction_id VARCHAR(50) NOT NULL,
+        title VARCHAR(100) NOT NULL,
+        amount DECIMAL(15,2) NOT NULL,
+        category VARCHAR(50) NOT NULL,
+        profit DECIMAL(15,2) DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'paid',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✅ Tabel digital_transactions siap.');
+  } catch (e) { console.error('Gagal membuat tabel:', e.message); }
+})();
+
 app.post('/api/payment/create-transaction', async (req, res) => {
-  const { name, email, phone, amount, kostName } = req.body;
-  const order_id = `SPOTKOS-${Date.now()}`;
+  const { name, email, phone, amount, kostName, roomId } = req.body;
+
+  // 1. Sanitasi Matematis Mutlak
+  const validAmount = Math.round(Number(amount));
+  if (!validAmount || validAmount < 1000) {
+    return res.status(400).json({ error: 'Nominal harga tidak valid' });
+  }
+
+  // 2. ID Transaksi Unik
+  const order_id = `SPOTKOS-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+  // 3. Sanitasi Teks Mutlak (Cegah Error Spasi & Limitasi Karakter Midtrans)
+  const safeName = (name || "Customer").substring(0, 25).trim();
+  const safeEmail = (email || "user@spotkos.com").replace(/\s/g, '').trim();
+  const safeKostName = (kostName || "Kost").substring(0, 30).trim();
+
+  // 4. Struktur Payload dengan ID Dinamis Anda
   const parameter = {
-    transaction_details: { order_id, gross_amount: amount },
-    customer_details: { first_name: name, email, phone },
-    item_details: [{ id: 'KOST-01', price: amount, quantity: 1, name: `Sewa ${kostName} (1 Bulan)` }]
+    transaction_details: { 
+      order_id: order_id, 
+      gross_amount: validAmount 
+    },
+    customer_details: { 
+      first_name: safeName, 
+      email: safeEmail, 
+      phone: phone || "080000000000" 
+    },
+    item_details: [{ 
+      id: roomId ? `ROOM-${roomId}` : 'KOST-000', // Sesuai logika input Anda
+      price: validAmount, 
+      quantity: 1, 
+      name: `Sewa ${safeKostName}` 
+    }]
   };
+
   try {
     const transaction = await snap.createTransaction(parameter);
     res.json({ token: transaction.token, order_id });
   } catch (error) {
-    console.error('Midtrans Error:', error);
+    console.error('Midtrans Error Detail:', error.message);
     res.status(500).json({ error: 'Gagal membuat transaksi Midtrans' });
   }
+});
+
+app.post('/api/promos/validate', async (req, res) => {
+  const { code, currentTotal, sector } = req.body;
+  try {
+    const [promos] = await db.query('SELECT * FROM promos WHERE code = ? AND sector = ?', [code, sector]);
+    if (promos.length === 0) return res.status(400).json({ error: 'Kode promo tidak valid/salah layanan' });
+    
+    const promo = promos[0];
+
+    // CEK TANGGAL KEDALUWARSA
+    if (new Date(promo.valid_until) < new Date()) {
+      return res.status(400).json({ error: 'Kode promo sudah kedaluwarsa' });
+    }
+
+    // CEK SYARAT MINIMAL PEMBELIAN
+    if (promo.min_purchase > 0 && currentTotal < promo.min_purchase) {
+      return res.status(400).json({ error: `Minimal transaksi Rp ${parseInt(promo.min_purchase).toLocaleString('id-ID')} untuk promo ini.` });
+    }
+
+    const discount = promo.discount_amount;
+    const finalPrice = Math.max(0, currentTotal - discount); 
+    res.json({ success: true, discount, finalPrice });
+  } catch (error) { res.status(500).json({ error: 'Gagal memvalidasi promo' }); }
 });
 
 app.post('/api/bookings', async (req, res) => {
@@ -86,30 +157,6 @@ app.post('/api/bookings', async (req, res) => {
 app.get('/api/bookings/user', async (req, res) => {
   const { email } = req.query;
   try {
-    const [rawBookings] = await db.query('SELECT * FROM bookings WHERE user_email = ?', [email]);
-    const now = new Date();
-
-    for (let b of rawBookings) {
-      if (b.status === 'paid') {
-        const dueDate = new Date(b.check_in_date);
-        dueDate.setMonth(dueDate.getMonth() + b.duration);
-        const cancelDate = new Date(dueDate);
-        cancelDate.setDate(cancelDate.getDate() + 3);
-
-        if (now > cancelDate) {
-          await db.query('UPDATE bookings SET status = "failed" WHERE id = ?', [b.id]);
-          if (b.room_id && b.floor_name) {
-            await db.query(
-              'UPDATE room_floors SET available_rooms = available_rooms + 1 WHERE room_id = ? AND floor_name = ?',
-              [b.room_id, b.floor_name]
-            );
-          }
-        } else if (now >= dueDate && now <= cancelDate) {
-          await db.query('UPDATE bookings SET status = "pending" WHERE id = ?', [b.id]);
-        }
-      }
-    }
-
     const [bookings] = await db.query(`
       SELECT b.id as booking_id, b.room_id as roomId, b.floor_name as floorName,
              DATE_FORMAT(b.created_at, "%d %b %Y") as bookingDate,
@@ -189,52 +236,52 @@ app.post('/api/transfer', async (req, res) => {
 app.post('/api/pay-kos', async (req, res) => {
   const { email, booking_id, amount, pin } = req.body;
 
-  if (!email || !booking_id || !amount || !pin) {
-    return res.status(400).json({ success: false, message: 'Data atau PIN tidak lengkap' });
-  }
+  if (!email || !booking_id || !amount || !pin) return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
 
   try {
     const [tenant] = await db.query('SELECT balance, pin FROM users WHERE email = ?', [email]);
     if (tenant.length === 0) return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
 
-    // Validasi Keamanan PIN
     if (!tenant[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di menu Keamanan Akun.' });
     if (tenant[0].pin !== pin) return res.status(400).json({ success: false, message: 'PIN Transaksi Anda salah!' });
-    if (tenant[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo SpotPay Anda tidak mencukupi, silakan Top Up.' });
+    if (tenant[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo SpotPay Anda tidak mencukupi.' });
 
     const [booking] = await db.query(
-      'SELECT b.status, b.room_id, b.floor_name, r.owner_email FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?',
+      'SELECT b.total_price, b.status, b.room_id, b.floor_name, r.owner_email FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?',
       [booking_id]
     );
 
     if (booking.length === 0) return res.status(404).json({ success: false, message: 'Tagihan tidak ditemukan' });
     if (booking[0].status === 'paid') return res.status(400).json({ success: false, message: 'Tagihan sudah lunas' });
 
+    // 1. Potong Saldo Penyewa & Lunaskan Tagihan
     await db.query('UPDATE users SET balance = balance - ? WHERE email = ?', [amount, email]);
     await db.query('UPDATE bookings SET status = "paid" WHERE id = ?', [booking_id]);
 
     if (booking[0].room_id && booking[0].floor_name) {
-      await db.query(
-        'UPDATE room_floors SET available_rooms = available_rooms - 1 WHERE room_id = ? AND floor_name = ?',
-        [booking[0].room_id, booking[0].floor_name]
-      );
+      await db.query('UPDATE room_floors SET available_rooms = available_rooms - 1 WHERE room_id = ? AND floor_name = ?', [booking[0].room_id, booking[0].floor_name]);
     }
 
+    // 2. Berikan Keuntungan 90% ke Pemilik (SpotKos Mengambil Komisi 10%)
     if (booking[0].owner_email) {
-      await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [amount, booking[0].owner_email]);
+      const dbTotalPrice = booking[0].total_price;
+      const basePrice = Math.round((dbTotalPrice - 25000) / 1.11); // Ekstrak harga dasar tanpa PPN
+      const pureIncomeToOwner = basePrice * 0.90; // Pemilik terima 90%
+      await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [pureIncomeToOwner, booking[0].owner_email]);
     }
 
     res.json({ success: true, message: 'Pembayaran Kos Berhasil!' });
-  } catch (error) {
-    console.error('Pay Kos Error:', error);
-    res.status(500).json({ success: false, message: 'Gagal memproses pembayaran kos' });
-  }
+  } catch (error) { res.status(500).json({ success: false, message: 'Gagal memproses pembayaran kos' }); }
 });
 
+// --- 1. API BAYAR VIA SALDO SPOTPAY (PULSA, LISTRIK, QRIS) ---
 app.post('/api/installments/pay', async (req, res) => {
-  const { email, bill_id, amount, pin } = req.body;
+  const email = req.body.email || req.body.userEmail;
+  const bill_id = req.body.bill_id || req.body.billId || 'PLN-TOKEN';
+  const amount = req.body.amount;
+  const pin = req.body.pin;
 
-  if (!email || !bill_id || !amount || !pin) {
+  if (!email || !amount || !pin) {
     return res.status(400).json({ success: false, message: 'Data atau PIN tidak lengkap' });
   }
 
@@ -242,18 +289,77 @@ app.post('/api/installments/pay', async (req, res) => {
     const [user] = await db.query('SELECT balance, pin FROM users WHERE email = ?', [email]);
     if (user.length === 0) return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
 
-    // Validasi Keamanan PIN
-    if (!user[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di menu Keamanan Akun.' });
+    if (!user[0].pin) return res.status(400).json({ success: false, message: 'Silakan buat PIN transaksi di Profil.' });
     if (user[0].pin !== pin) return res.status(400).json({ success: false, message: 'PIN Transaksi Anda salah!' });
-    if (user[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi untuk transaksi ini.' });
+    if (user[0].balance < amount) return res.status(400).json({ success: false, message: 'Saldo tidak mencukupi.' });
 
+    // LOGIKA PENENTUAN KATEGORI (Pulsa, QRIS, atau Listrik)
+    let category = 'listrik';
+    let title = 'Token Listrik PLN';
+    let profit = 2000;
+
+    if (bill_id.startsWith('PULSA')) {
+      category = 'pulsa';
+      title = 'Pembelian Pulsa';
+    } else if (bill_id.startsWith('QRIS')) {
+      category = 'qris';
+      title = 'Pembayaran Merchant QRIS';
+      profit = 500; // Komisi admin dari transaksi QRIS
+    }
+
+    let tokenListrik = '';
+    if (category === 'listrik') {
+       tokenListrik = Array.from({length: 5}, () => Math.floor(1000 + Math.random() * 9000)).join('-');
+       title = `Token: ${tokenListrik}`;
+    }
+
+    // 1. Potong saldo SpotPay
     await db.query('UPDATE users SET balance = balance - ? WHERE email = ?', [amount, email]);
 
-    res.json({ success: true, message: 'Transaksi Berhasil!' });
-  } catch (error) {
-    console.error('Installment Error:', error);
-    res.status(500).json({ success: false, message: 'Gagal memproses transaksi' });
+    // 2. Simpan ke database digital (Agar muncul di Admin & Riwayat SpotPay)
+    await db.query(
+      'INSERT INTO digital_transactions (user_email, transaction_id, title, amount, category, profit, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [email, bill_id + '-' + Date.now().toString().slice(-4), title, amount, category, profit, 'paid']
+    );
+    
+    res.json({ success: true, message: category === 'listrik' ? title : 'Pembayaran Berhasil' });
+  } catch (error) { 
+    console.error('SpotPay Error:', error);
+    res.status(500).json({ success: false, message: 'Server error' }); 
   }
+});
+
+// --- 2. API BAYAR VIA MIDTRANS ---
+app.post('/api/digital-transactions/log', async (req, res) => {
+  const email = req.body.email || req.body.userEmail || req.body.user_email || 'user@spotkos.com';
+  const bill_id = req.body.bill_id || req.body.billId || 'PLN-TOKEN';
+  const amount = req.body.amount || 0;
+  
+  const category = bill_id.startsWith('PULSA') ? 'pulsa' : 'listrik';
+  
+  let tokenListrik = '';
+  let title = category === 'pulsa' ? 'Pembelian Pulsa (Midtrans)' : 'Token Listrik PLN';
+  
+  if (category === 'listrik') {
+     tokenListrik = Array.from({length: 5}, () => Math.floor(1000 + Math.random() * 9000)).join('-');
+     title = `Token: ${tokenListrik}`;
+  }
+
+  try {
+    await db.query('INSERT INTO digital_transactions (user_email, transaction_id, title, amount, category, profit, status) VALUES (?, ?, ?, ?, ?, ?, ?)', [email, bill_id + '-' + Date.now().toString().slice(-4), title, amount, category, 2000, 'paid']);
+    res.json({ success: true, message: title }); 
+  } catch (error) { 
+    console.error('Midtrans Log Error:', error);
+    res.status(500).json({ error: 'Gagal mencatat transaksi' }); 
+  }
+});
+
+app.get('/api/digital-transactions/user', async (req, res) => {
+  const { email } = req.query;
+  try {
+    const [txs] = await db.query('SELECT *, DATE_FORMAT(created_at, "%d %b %Y") as date_label FROM digital_transactions WHERE user_email = ? ORDER BY created_at DESC', [email]);
+    res.json(txs);
+  } catch (error) { res.status(500).json({ error: 'Gagal mengambil data' }); }
 });
 
 // =========================================================================
@@ -318,38 +424,32 @@ app.post('/api/promos/claim', async (req, res) => {
 
 app.put('/api/bookings/:id/status', async (req, res) => {
   const { id } = req.params;
-  const { status, roomId, floorName } = req.body;
+  const { status } = req.body;
 
   try {
     const [result] = await db.query('UPDATE bookings SET status = ? WHERE id = ?', [status, id]);
     if (result.affectedRows === 0) return res.status(404).json({ error: 'Data booking tidak ditemukan.' });
 
     if (status === 'paid') {
-      if (roomId && floorName) {
-        await db.query(
-          'UPDATE room_floors SET available_rooms = available_rooms - 1 WHERE room_id = ? AND floor_name = ?',
-          [roomId, floorName]
-        );
-      }
       const [bookingInfo] = await db.query(
-        `SELECT b.duration, r.price, r.owner_email 
-         FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?`,
-        [id]
+        `SELECT b.room_id, b.floor_name, b.total_price, r.owner_email 
+         FROM bookings b JOIN rooms r ON b.room_id = r.id WHERE b.id = ?`, [id]
       );
-      if (bookingInfo.length > 0 && bookingInfo[0].owner_email) {
-        const pureIncome = bookingInfo[0].price * bookingInfo[0].duration;
-        await db.query(
-          'UPDATE users SET balance = balance + ? WHERE email = ?',
-          [pureIncome, bookingInfo[0].owner_email]
-        );
+      
+      if (bookingInfo.length > 0) {
+        const bData = bookingInfo[0];
+        if (bData.room_id && bData.floor_name) {
+          await db.query('UPDATE room_floors SET available_rooms = available_rooms - 1 WHERE room_id = ? AND floor_name = ?', [bData.room_id, bData.floor_name]);
+        }
+        if (bData.owner_email) {
+          const basePrice = Math.round((bData.total_price - 25000) / 1.11);
+          const pureIncomeToOwner = basePrice * 0.90; // Potongan Admin 10% via Midtrans
+          await db.query('UPDATE users SET balance = balance + ? WHERE email = ?', [pureIncomeToOwner, bData.owner_email]);
+        }
       }
     }
-
     res.json({ message: `Status berhasil diubah menjadi ${status}` });
-  } catch (error) {
-    console.error('Update Booking Status Error:', error);
-    res.status(500).json({ error: 'Gagal mengubah status' });
-  }
+  } catch (error) { res.status(500).json({ error: 'Gagal mengubah status' }); }
 });
 
 app.post('/api/withdrawals', async (req, res) => {
@@ -421,24 +521,81 @@ app.get('/api/admin/transactions', async (req, res) => {
     const [transactions] = await db.query(`
       SELECT 
         b.id as invoice_id,
+        b.id as transaction_id,
         DATE_FORMAT(b.created_at, "%d %b %Y, %H:%i") as datetime,
         b.created_at as raw_date,
         r.name as kost_name,
         r.location as kost_location,
         b.total_price,
+        b.total_price as amount,
         b.status,
         u.full_name as user_name,
-        u.email as user_email
+        u.email as user_email,
+        'kos' as category,
+        NULL as title
       FROM bookings b
       JOIN rooms r ON b.room_id = r.id
       JOIN users u ON b.user_email = u.email
-      ORDER BY b.created_at DESC
+
+      UNION ALL
+
+      SELECT 
+        d.transaction_id as invoice_id,
+        d.transaction_id as transaction_id,
+        DATE_FORMAT(d.created_at, "%d %b %Y, %H:%i") as datetime,
+        d.created_at as raw_date,
+        NULL as kost_name,
+        NULL as kost_location,
+        d.amount as total_price,
+        d.amount as amount,
+        d.status,
+        u.full_name as user_name,
+        d.user_email as user_email,
+        d.category,
+        d.title
+      FROM digital_transactions d
+      LEFT JOIN users u ON d.user_email = u.email
+
+      ORDER BY raw_date DESC
     `);
-    res.json(transactions);
+    
+    // Jaring pengaman agar React tidak crash "N.map is not a function"
+    res.json(Array.isArray(transactions) ? transactions : []);
   } catch (error) {
     console.error('Get Transactions Error:', error);
-    res.status(500).json({ error: 'Gagal mengambil data transaksi' });
+    res.json([]); 
   }
+});
+
+app.get('/api/admin/promos', async (req, res) => {
+  try {
+    const [promos] = await db.query('SELECT * FROM promos ORDER BY valid_until DESC');
+    res.json(promos);
+  } catch (e) { 
+    console.error('Promos Error:', e);
+    res.json([]); // Jaring pengaman: Kembalikan array kosong agar React tidak "N.map is not a function"
+  }
+});
+
+app.post('/api/admin/promos', async (req, res) => {
+  const { code, discount, sector, min_purchase, valid_until } = req.body;
+  try {
+    await db.query(
+      'INSERT INTO promos (code, discount_amount, sector, min_purchase, valid_until) VALUES (?, ?, ?, ?, ?)', 
+      [code, discount, sector, min_purchase || 0, valid_until]
+    );
+    res.json({ success: true });
+  } catch (e) { 
+    console.error('Error Add Promo:', e);
+    res.status(500).json({ error: 'Gagal membuat promo' }); 
+  }
+});
+
+app.delete('/api/admin/promos/:id', async (req, res) => {
+  try {
+    await db.query('DELETE FROM promos WHERE id = ?', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Error' }); }
 });
 
 setInterval(async () => {
@@ -448,10 +605,10 @@ setInterval(async () => {
     );
     const [expired] = await db.query(
       `SELECT id, room_id, floor_name FROM bookings 
-       WHERE status = 'pending' AND CURDATE() > DATE_ADD(due_date, INTERVAL 3 DAY)`
+       WHERE status = 'pending' AND CURDATE() > DATE_ADD(due_date, INTERVAL 7 DAY)`
     );
     for (let b of expired) {
-      await db.query(`UPDATE bookings SET status = 'cancelled' WHERE id = ?`, [b.id]);
+      await db.query(`UPDATE bookings SET status = 'failed' WHERE id = ?`, [b.id]);
       await db.query(
         `UPDATE room_floors SET available_rooms = available_rooms + 1 WHERE room_id = ? AND floor_name = ?`,
         [b.room_id, b.floor_name]

@@ -131,7 +131,9 @@ app.use((req, res, next) => {
     url.startsWith('/api/bookings') ||
     url.startsWith('/api/withdrawals') ||
     url.startsWith('/api/admin/withdrawals') ||
-    url.startsWith('/api/admin/transactions')
+    url.startsWith('/api/admin/transactions') ||
+    url.startsWith('/api/admin/promos') ||
+    url.startsWith('/api/digital-transactions')
   ) {
     return txServiceProxy(req, res, next);
   }

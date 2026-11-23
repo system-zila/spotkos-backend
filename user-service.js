@@ -305,7 +305,7 @@ app.post('/api/admin/login', async (req, res) => {
 app.get('/api/admin/verifications', async (req, res) => {
   try {
     const [users] = await db.query(
-      `SELECT full_name as name, email, phone, ktp_image, selfie_image, owner_status as status 
+      `SELECT id, full_name as name, email, phone, ktp_image, selfie_image, owner_status as status 
        FROM users WHERE owner_status != "unverified"`
     );
     res.json(users);
